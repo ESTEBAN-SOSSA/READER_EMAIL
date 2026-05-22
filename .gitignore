@@ -1,0 +1,44 @@
+# Entorno y secretos
+.env
+.env.local
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Datos generados
+data/
+*.db
+*.sqlite
+*.sqlite3
+downloads/
+attachments/
+logs/
+*.log
+
+# Exports y archivos temporales de Office
+cotizaciones*.xlsx
+~$*.xlsx
+~$*.docx
+~$*.xls
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

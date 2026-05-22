@@ -1,0 +1,116 @@
+# =====================================================
+# Reglas para identificar solicitudes de cotizacion / licitacion
+# =====================================================
+
+# MODO ESTRICTO: la keyword DEBE aparecer en el ASUNTO del correo.
+# Esto evita capturar correos que solo mencionan "cotizacion" de paso
+# en el cuerpo (firmas, plantillas, hilos antiguos).
+keyword_in_subject_only: true
+
+# Palabras clave que identifican una solicitud de cotizacion, licitacion
+# o solicitud relacionada con compras.
+keywords:
+  # --- Cotizacion ---
+  - cotizacion
+  - cotización
+  - cotizar
+  - cotice
+  - cotiza
+  - quotation
+  - quote
+  - rfq
+  - request for quote
+  - request for quotation
+
+  # --- Licitacion ---
+  - licitacion
+  - licitación
+  - licitar
+  - tender
+  - bid
+  - bidding
+  - rfp
+  - request for proposal
+  - invitation to bid
+  - sourcing event
+
+  # --- Solicitud de oferta / precio / compra ---
+  - solicitud de oferta
+  - solicitud de precio
+  - solicitud de cotizacion
+  - solicitud de cotización
+  - solicitud cotizacion
+  - solicitud cotización
+  - solicitud de compra
+  - solicitud compra
+  - requerimiento de compra
+  - requisicion
+  - requisición
+
+  # --- Genericas ---
+  - presupuesto
+  - oferta
+  - propuesta comercial
+
+# Excluir correos de estos dominios/strings.
+# NO incluimos edemco.co porque los colaboradores INTERNOS reenvian
+# cotizaciones de clientes al buzon para que se trabajen.
+exclude_sender_domains:
+  - mailchimp.com
+  - sendgrid.net
+  - noreply
+  - no-reply
+  - notifications
+  - mailer-daemon
+  - postmaster
+
+# Prefijos del asunto que descartamos.
+# Vacio = aceptamos RE: y RV: tambien, porque pueden ser reenvios
+# legitimos de cotizaciones.
+exclude_subject_prefixes: []
+
+# Strings que si aparecen en CUALQUIER parte del asunto descartan el correo.
+# Estos son OC ya aprobadas, facturas, despachos: NO son cotizaciones pendientes.
+exclude_subject_contains:
+  # --- Ordenes de compra ya aprobadas ---
+  - "OCC"
+  - "OCS"
+  - "O.C:"
+  - "O.C "
+  - "OC "
+  - "Orden de Compra"
+  - "Orden de compra"
+  - "orden de compra"
+  - "purchase order"
+
+  # --- Facturas y pagos ---
+  - "facturar"
+  - "facturacion"
+  - "facturación"
+  - "documento factura"
+  - "factura electronica"
+  - "factura electrónica"
+  - "pago de factura"
+  - "nota credito"
+  - "nota crédito"
+  - "nota debito"
+  - "nota débito"
+
+  # --- Logistica/operaciones ya cerradas ---
+  - "remision"
+  - "remisión"
+  - "entrada para facturar"
+  - "despacho"
+  - "entrega de mercancia"
+  - "entrega de mercancía"
+  - "confirmacion de pedido"
+  - "confirmación de pedido"
+
+# Tipos de adjunto que procesamos
+attachment_extensions:
+  - .pdf
+  - .xlsx
+  - .xls
+  - .csv
+  - .docx
+  - .doc
