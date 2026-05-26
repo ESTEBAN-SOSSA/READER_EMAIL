@@ -135,56 +135,84 @@ def run(
                     console.print(f"[red]Error leyendo {mailbox}: {exc}[/red]")
                     continue
 
-                if not messages:
-                    console.print("  [dim]Sin cotizaciones nuevas.[/dim]")
-                    continue
-
-                if not dry_run:
+                nuevas = 0
+                actualizadas = 0
+                if messages and not dry_run:
                     for msg in messages:
+                        existia = upsert_quote(session, msg.id) is not None
                         _guardar(session, msg)
+                        if existia:
+                            actualizadas += 1
+                        else:
+                            nuevas += 1
 
-                # Resumen por buzon
-                _mostrar_dashboard(messages, mailbox)
+                # Resumen consultando la BD (toda la historia acumulada del buzon)
+                _mostrar_dashboard_db(session, mailbox, nuevas, actualizadas)
 
     console.print("\n[bold green]Listo.[/bold green] Usa [cyan]list-pending[/cyan] para ver las pendientes.")
 
 
-def _mostrar_dashboard(messages: list[Message], mailbox: str) -> None:
-    total = len(messages)
-    respondidas = sum(1 for m in messages if m.was_replied)
-    pendientes_msgs = [m for m in messages if not m.was_replied]
-    pendientes = len(pendientes_msgs)
+def _mostrar_dashboard_db(
+    session: Session, mailbox: str, nuevas: int, actualizadas: int
+) -> None:
+    """Lee todas las cotizaciones del buzon desde la BD (historico acumulado)."""
+    rows = session.execute(
+        select(QuoteRequestRow).where(QuoteRequestRow.mailbox == mailbox)
+    ).scalars().all()
+
+    total = len(rows)
+    if total == 0:
+        console.print("  [dim]Sin cotizaciones en historia para este buzon.[/dim]")
+        return
+
+    respondidas = sum(1 for r in rows if r.was_replied)
+    pendientes_rows = [r for r in rows if not r.was_replied]
+    pendientes = len(pendientes_rows)
     pct_resp = (respondidas / total * 100) if total else 0
 
-    dias_pend = [d for m in pendientes_msgs if (d := _dias_desde(m.received_at)) is not None]
+    dias_pend = [
+        d for r in pendientes_rows
+        if (d := _dias_desde(r.received_at)) is not None
+    ]
     prom_dias = (sum(dias_pend) / len(dias_pend)) if dias_pend else 0
     mas_antigua_dias = max(dias_pend) if dias_pend else 0
     urgentes = sum(1 for d in dias_pend if d > 3)
+    criticas = sum(1 for d in dias_pend if d > 7)
 
     console.print()
     console.print(f"  [bold cyan]Resumen del buzon[/bold cyan] {mailbox}:")
-    console.print(f"    Total identificadas:                 [bold]{total}[/bold]")
     console.print(
-        f"    [green]Respondidas al cliente:[/green]   [bold]{respondidas}[/bold]  "
+        f"    Esta corrida:  [bold green]+{nuevas}[/bold green] nuevas, "
+        f"[dim]{actualizadas} actualizadas[/dim]"
+    )
+    console.print(f"    [bold]Acumulado en BD[/bold] (toda la historia):")
+    console.print(f"      Total identificadas:                 [bold]{total}[/bold]")
+    console.print(
+        f"      [green]Respondidas al cliente:[/green]   [bold]{respondidas}[/bold]  "
         f"([dim]{pct_resp:.0f}%[/dim])"
     )
     console.print(
-        f"    [yellow]PENDIENTES de responder:[/yellow]  [bold]{pendientes}[/bold]  "
+        f"      [yellow]PENDIENTES de responder:[/yellow]  [bold]{pendientes}[/bold]  "
         f"([dim]{100 - pct_resp:.0f}%[/dim])"
     )
     if dias_pend:
         console.print(
-            f"      [dim]· Espera promedio:[/dim]            "
+            f"        [dim]· Espera promedio:[/dim]            "
             f"[bold]{prom_dias:.1f} dias[/bold]"
         )
         console.print(
-            f"      [dim]· Mas antigua:[/dim]                "
+            f"        [dim]· Mas antigua:[/dim]                "
             f"{_color_dias(mas_antigua_dias)}"
         )
         if urgentes:
             console.print(
-                f"      [red]· Mas de 3 dias sin responder:[/red]   "
+                f"        [red]· Mas de 3 dias sin responder:[/red]   "
                 f"[bold red]{urgentes}[/bold red]"
+            )
+        if criticas:
+            console.print(
+                f"        [bold red]· CRITICAS (>7 dias):[/bold red]            "
+                f"[bold red on white] {criticas} [/bold red on white]"
             )
 
 
