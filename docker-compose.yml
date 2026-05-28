@@ -1,0 +1,20 @@
+services:
+  reader:
+    build: .
+    image: intervencion_buzon:latest
+    container_name: INTERVENCION_BUZON
+    # Carga las credenciales de Azure y la config del lector desde .env
+    # (copia .env.example a .env y complétalo antes de levantar).
+    env_file:
+      - .env
+    volumes:
+      # Persistencia de la base SQLite y los adjuntos descargados entre corridas.
+      - ./data:/app/data
+      - ./attachments:/app/attachments
+      # Permite editar keywords/blacklist sin reconstruir la imagen.
+      - ./config/settings.yaml:/app/config/settings.yaml:ro
+    # Comando por defecto: leer buzones y procesar cotizaciones.
+    # Override por CLI:  docker compose run --rm reader list-pending
+    command: ["run"]
+    # No reiniciar: es un job puntual que termina al acabar la corrida.
+    restart: "no"

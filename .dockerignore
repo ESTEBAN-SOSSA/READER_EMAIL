@@ -1,0 +1,54 @@
+# Control de versiones / metadata
+.git
+.gitignore
+README.md
+
+# Secretos y entorno local (se inyectan via env_file/variables, NO en la imagen)
+.env
+.env.local
+*.pem
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+
+# Datos generados (se montan como volumenes, no van en la imagen)
+data/
+attachments/
+downloads/
+logs/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Exports de Office
+cotizaciones*.xlsx
+~$*.xlsx
+~$*.docx
+~$*.xls
+
+# Caches de Python / herramientas
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# IDE / SO
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose.yml

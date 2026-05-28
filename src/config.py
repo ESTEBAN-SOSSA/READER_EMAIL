@@ -20,6 +20,7 @@ class Settings:
     mailboxes: list[str]
     max_messages_per_mailbox: int
     unread_only: bool
+    only_today: bool
     attachments_dir: Path
     database_path: Path
     log_level: str
@@ -29,7 +30,9 @@ class Settings:
     exclude_sender_domains: list[str] = field(default_factory=list)
     exclude_subject_prefixes: list[str] = field(default_factory=list)
     exclude_subject_contains: list[str] = field(default_factory=list)
+    exclude_body_contains: list[str] = field(default_factory=list)
     attachment_extensions: list[str] = field(default_factory=list)
+    group_reference_regex: str = ""   # patron para agrupar cotizaciones (escenario 2)
 
 
 def _require(name: str) -> str:
@@ -55,6 +58,7 @@ def load_settings(settings_path: Path | None = None) -> Settings:
         mailboxes=mailboxes,
         max_messages_per_mailbox=int(os.getenv("MAX_MESSAGES_PER_MAILBOX", "50")),
         unread_only=os.getenv("UNREAD_ONLY", "true").lower() == "true",
+        only_today=os.getenv("ONLY_TODAY", "false").lower() == "true",
         attachments_dir=ROOT / os.getenv("ATTACHMENTS_DIR", "./attachments"),
         database_path=ROOT / os.getenv("DATABASE_PATH", "./data/reader_email.db"),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -65,5 +69,7 @@ def load_settings(settings_path: Path | None = None) -> Settings:
         ),
         exclude_subject_prefixes=raw.get("exclude_subject_prefixes", []),
         exclude_subject_contains=raw.get("exclude_subject_contains", []),
+        exclude_body_contains=raw.get("exclude_body_contains", []),
         attachment_extensions=raw.get("attachment_extensions", []),
+        group_reference_regex=raw.get("group_reference_regex", ""),
     )
