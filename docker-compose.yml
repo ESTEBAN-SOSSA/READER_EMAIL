@@ -18,3 +18,29 @@ services:
     command: ["run"]
     # No reiniciar: es un job puntual que termina al acabar la corrida.
     restart: "no"
+
+  # UI Streamlit para revisar decisiones de Claude y aprobar/rechazar
+  # cotizaciones + aprobar reglas semanticas sugeridas. Se mantiene viva.
+  reviewer-ui:
+    build: .
+    image: intervencion_buzon:latest
+    container_name: INTERVENCION_BUZON_UI
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./attachments:/app/attachments
+      - ./config/settings.yaml:/app/config/settings.yaml:ro
+    ports:
+      - "8501:8501"
+    entrypoint: []
+    command: [
+      "streamlit", "run", "ui/reviewer.py",
+      "--server.address=0.0.0.0",
+      "--server.port=8501",
+      "--server.headless=true",
+      "--browser.gatherUsageStats=false",
+    ]
+    restart: unless-stopped
+    depends_on:
+      - reader

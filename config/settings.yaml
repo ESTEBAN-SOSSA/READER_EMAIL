@@ -71,6 +71,26 @@ exclude_sender_domains:
 # legitimos de cotizaciones.
 exclude_subject_prefixes: []
 
+# Prefijos que MARCAN un asunto como reenvio/respuesta legitima.
+# Si un correo es del dominio interno PERO su asunto empieza con uno de estos,
+# se considera un reenvio/respuesta de una cotizacion externa y se mantiene.
+# Si el correo es interno y su asunto NO tiene ninguno de estos prefijos,
+# y ademas el hilo es puramente interno, se descarta como "hilo_interno_puro".
+internal_forward_subject_prefixes:
+  - "RE:"
+  - "Re:"
+  - "Res:"
+  - "RV:"
+  - "Rv:"
+  - "FW:"
+  - "Fw:"
+  - "FWD:"
+  - "Fwd:"
+  - "PSI:"
+  - "FYI:"
+  - "FYI."
+  - "Reply:"
+
 # Strings que si aparecen en CUALQUIER parte del asunto descartan el correo.
 # Estos son OC ya aprobadas, facturas, despachos: NO son cotizaciones pendientes.
 exclude_subject_contains:

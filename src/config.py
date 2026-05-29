@@ -33,6 +33,12 @@ class Settings:
     exclude_body_contains: list[str] = field(default_factory=list)
     attachment_extensions: list[str] = field(default_factory=list)
     group_reference_regex: str = ""   # patron para agrupar cotizaciones (escenario 2)
+    internal_forward_subject_prefixes: list[str] = field(default_factory=list)
+
+    # Clasificacion semantica con Claude
+    anthropic_api_key: str = ""
+    anthropic_model: str = "claude-haiku-4-5"
+    use_claude_classifier: bool = False
 
 
 def _require(name: str) -> str:
@@ -72,4 +78,8 @@ def load_settings(settings_path: Path | None = None) -> Settings:
         exclude_body_contains=raw.get("exclude_body_contains", []),
         attachment_extensions=raw.get("attachment_extensions", []),
         group_reference_regex=raw.get("group_reference_regex", ""),
+        internal_forward_subject_prefixes=raw.get("internal_forward_subject_prefixes", []),
+        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+        anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5"),
+        use_claude_classifier=os.getenv("USE_CLAUDE_CLASSIFIER", "false").lower() == "true",
     )

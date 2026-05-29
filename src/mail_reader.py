@@ -154,6 +154,51 @@ def _dominio(email: str) -> str:
     return email.split("@", 1)[1].lower() if email and "@" in email else ""
 
 
+def _es_hilo_interno_puro(
+    sender_email: str,
+    subject: str,
+    conv_msgs: list[dict],
+    internal_domain: str,
+    forward_prefixes: list[str],
+) -> bool:
+    """True si TODAS estas condiciones se cumplen:
+    - El remitente es del dominio INTERNO.
+    - El asunto NO empieza con ningun prefijo de reenvio/respuesta (RE:, RV:,
+      FW:, FWD:, PSI:, FYI:, etc.).
+    - El hilo NO tiene ningun remitente ni destinatario externo (es 100% interno).
+
+    Cubre el caso de correos internos que mencionan keywords como 'cotizador'
+    pero son discusiones internas (sobre la herramienta/plataforma, no sobre una
+    cotizacion de cliente real)."""
+    internal = internal_domain.lower().lstrip("@")
+    if not internal:
+        return False
+    if not sender_email.lower().endswith(internal):
+        return False  # remitente no es interno -> no aplica esta regla
+
+    # ¿El asunto tiene marca de reenvio/respuesta? Si si -> se salva.
+    s = (subject or "").strip().lower()
+    for p in forward_prefixes or []:
+        if s.startswith(p.lower()):
+            return False
+
+    # ¿Algun mensaje del hilo cruza la frontera externa?
+    for m in conv_msgs or []:
+        sender = (
+            ((m.get("from") or {}).get("emailAddress") or {}).get("address") or ""
+        ).lower()
+        if sender and not sender.endswith(internal):
+            return False  # hay un remitente externo en el hilo -> mantener
+        for rec_field in ("toRecipients", "ccRecipients"):
+            for r in m.get(rec_field) or []:
+                addr = (
+                    (r.get("emailAddress") or {}).get("address") or ""
+                ).lower()
+                if addr and not addr.endswith(internal):
+                    return False  # hay un destinatario externo -> mantener
+    return True
+
+
 def _es_cadena_saliente(conv_msgs: list[dict], internal_domain: str) -> bool:
     """True si el PRIMER mensaje del hilo (mas antiguo) lo envio alguien INTERNO
     a destinatarios TODOS externos. Significa que EDEMCO inicio la conversacion
@@ -616,6 +661,15 @@ class MailReader:
             # -> no es una solicitud de cotizacion entrante, descartar.
             if _es_cadena_saliente(conv_msgs, internal_domain):
                 descartados.append((gid, subject, "cotizacion_saliente"))
+                continue
+
+            # Filtro 5: hilo PURAMENTE INTERNO (correo interno sin marca de reenvio
+            # y sin externos en el hilo) -> es discusion interna, no cotizacion real.
+            if _es_hilo_interno_puro(
+                sender_email, subject, conv_msgs, internal_domain,
+                self.settings.internal_forward_subject_prefixes,
+            ):
+                descartados.append((gid, subject, "hilo_interno_puro"))
                 continue
 
             was_replied, replied_at, cliente_ext = self.is_replied_to_client(

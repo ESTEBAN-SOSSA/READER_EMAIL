@@ -20,6 +20,7 @@ RUN pip install --upgrade pip && \
 # ---- Codigo de la aplicacion ----
 COPY src/ ./src/
 COPY config/ ./config/
+COPY ui/ ./ui/
 
 # Directorios de datos persistentes (se montan como volumenes en runtime).
 # config.py resuelve estas rutas relativas a la raiz del proyecto (/app).

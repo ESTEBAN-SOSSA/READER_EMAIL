@@ -25,13 +25,19 @@ from .config import load_settings
 from .graph_client import GraphClient
 from .mail_reader import MailReader, Message
 from .storage import (
+    ClaudeReview,
+    LearnedRule,
     ProcessedMessage,
     QuoteRelatedMessage,
     QuoteRequestRow,
+    apply_learned_rules_to_settings,
     find_by_imid,
+    get_pending_reviews,
+    get_recent_human_examples,
     get_skip_ids,
     init_db,
     mark_processed,
+    upsert_claude_review,
     upsert_quote,
     upsert_related,
 )
@@ -78,6 +84,12 @@ def _setup_logging(level: str) -> None:
     )
     for noisy in ("httpx", "httpcore", "msal", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+def guardar_aprobada(session: Session, msg: Message) -> QuoteRequestRow:
+    """Wrapper publico para que el UI pueda guardar una cotizacion aprobada por
+    un humano. Delega en _guardar (idempotente por graph_id)."""
+    return _guardar(session, msg)
 
 
 def _guardar(session: Session, msg: Message) -> QuoteRequestRow:
@@ -149,6 +161,14 @@ def run(
         False, "--no-backfill",
         help="No insertar originales faltantes detectados a partir de una RE.",
     ),
+    no_claude: bool = typer.Option(
+        False, "--no-claude",
+        help="Desactiva la clasificacion semantica con Claude (solo reglas determinsticas).",
+    ),
+    max_claude_calls: int = typer.Option(
+        100, "--max-claude-calls",
+        help="Tope de llamadas a Claude por corrida (proteccion de credito).",
+    ),
 ) -> None:
     """Lee buzones, identifica cotizaciones y verifica cuales no han sido respondidas."""
     settings = load_settings()
@@ -159,6 +179,47 @@ def run(
         raise typer.Exit(code=1)
 
     engine = init_db(settings.database_path)
+
+    # Mezclar reglas aprendidas con settings + preparar clasificador IA
+    clasificador = None
+    with Session(engine) as _s0:
+        apply_learned_rules_to_settings(_s0, settings)
+        claude_activo = (
+            settings.use_claude_classifier
+            and bool(settings.anthropic_api_key)
+            and not no_claude
+        )
+        if claude_activo:
+            try:
+                from .clasificador import Clasificador
+                clasificador = Clasificador(
+                    api_key=settings.anthropic_api_key,
+                    model=settings.anthropic_model,
+                )
+                ejemplos = get_recent_human_examples(_s0, limit=12)
+                clasificador.preparar_system_prompt(
+                    reglas_vigentes={
+                        "keywords": settings.keywords,
+                        "exclude_subject_contains": settings.exclude_subject_contains,
+                        "exclude_body_contains": settings.exclude_body_contains,
+                        "exclude_sender_domains": settings.exclude_sender_domains,
+                    },
+                    ejemplos_humanos=ejemplos,
+                )
+                console.print(
+                    f"  [cyan]Claude activo:[/cyan] modelo={settings.anthropic_model} "
+                    f"· tope/corrida={max_claude_calls} · ejemplos few-shot={len(ejemplos)}"
+                )
+            except Exception as exc:
+                console.print(f"[yellow]No se pudo inicializar Claude: {exc}[/yellow]")
+                clasificador = None
+        else:
+            if settings.use_claude_classifier and not settings.anthropic_api_key:
+                console.print(
+                    "[yellow]USE_CLAUDE_CLASSIFIER=true pero falta ANTHROPIC_API_KEY → fallback determinstico[/yellow]"
+                )
+
+    claude_calls_realizadas = 0
 
     with GraphClient(settings.tenant_id, settings.client_id, settings.client_secret) as client:
         reader = MailReader(client, settings)
@@ -182,9 +243,36 @@ def run(
                 re_nuevas = 0
                 re_actualizadas = 0
                 copias_buzon = 0
+                claude_clasificados = 0
+                claude_no_aplicado = 0
                 limbo_re: list[str] = []
                 backfill_errores: list[tuple[str, str]] = []
                 if not dry_run:
+                    # Capa Claude: si esta activo, todos los mensajes relevantes
+                    # se desvian a claude_reviews (pendiente revision humana) en
+                    # vez de quote_requests. La aprobacion se hace por el UI.
+                    if clasificador is not None:
+                        a_clasificar = [
+                            m for m in messages
+                            if session.get(ClaudeReview, m.id) is None
+                        ]
+                        for msg in a_clasificar:
+                            if claude_calls_realizadas >= max_claude_calls:
+                                claude_no_aplicado += 1
+                                continue
+                            veredicto = clasificador.clasificar(msg)
+                            claude_calls_realizadas += 1
+                            if veredicto is None:
+                                claude_no_aplicado += 1
+                                continue
+                            upsert_claude_review(session, msg, veredicto)
+                            mark_processed(
+                                session, msg.id, mailbox, msg.subject,
+                                "identificado", "pendiente_revision_claude",
+                            )
+                            claude_clasificados += 1
+                        messages = []  # bypaseamos el flujo determinstico de save
+
                     # Fase B: originales -> quote_requests; respuestas -> sub-tabla.
                     # Primero originales (para que la RE encuentre a su padre).
                     originales = [m for m in messages if m.is_original]
@@ -318,6 +406,16 @@ def run(
                         f"    [bold magenta]Copias cross-mailbox:[/bold magenta] "
                         f"{copias_buzon} correo(s) que ya estaban registrados en otro buzon"
                     )
+                if claude_clasificados:
+                    console.print(
+                        f"    [bold cyan]Clasificados por Claude (pendientes humano):[/bold cyan] "
+                        f"{claude_clasificados}"
+                    )
+                if claude_no_aplicado:
+                    console.print(
+                        f"    [yellow]Claude no aplicado en {claude_no_aplicado} correo(s) "
+                        f"(tope alcanzado o error API)[/yellow]"
+                    )
                 if backfill_errores:
                     console.print(
                         f"    [yellow]Backfill no recuperable:[/yellow] "
@@ -335,6 +433,19 @@ def run(
                 _mostrar_dashboard_db(
                     session, mailbox, nuevas, actualizadas, len(descartados)
                 )
+
+    # Reporte global de revisiones pendientes (si Claude esta activo)
+    if clasificador is not None:
+        with Session(engine) as _sf:
+            pend = len(get_pending_reviews(_sf, limit=1000))
+        console.print(
+            f"\n[bold cyan]Claude llamadas esta corrida:[/bold cyan] {claude_calls_realizadas}"
+        )
+        if pend:
+            console.print(
+                f"[yellow bold]Pendientes de revision humana en BD:[/yellow bold] {pend}\n"
+                f"  Abre el UI en [cyan]http://localhost:8501[/cyan] para revisarlas."
+            )
 
     console.print("\n[bold green]Listo.[/bold green] Usa [cyan]list-pending[/cyan] para ver las pendientes.")
 

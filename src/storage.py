@@ -107,6 +107,60 @@ class ProcessedMessage(Base):
     processed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class ClaudeReview(Base):
+    """Veredicto semantico de Claude para un correo + decision humana.
+    Los correos que pasan los filtros determinsticos pasan por aqui antes de
+    entrar a quote_requests (cuando USE_CLAUDE_CLASSIFIER esta activo)."""
+    __tablename__ = "claude_reviews"
+
+    graph_id: Mapped[str] = mapped_column(String(512), primary_key=True)
+    mailbox: Mapped[str] = mapped_column(String(255), index=True, default="")
+    subject: Mapped[str] = mapped_column(String(1024), default="")
+    sender_email: Mapped[str] = mapped_column(String(320), default="")
+    received_at: Mapped[str] = mapped_column(String(64), default="")
+    internet_message_id: Mapped[str | None] = mapped_column(String(998), index=True, nullable=True)
+
+    # Mensaje completo serializado para reconstruirlo al aprobar
+    message_json: Mapped[str] = mapped_column(Text, default="{}")
+
+    # Veredicto de Claude
+    es_cotizacion_cliente: Mapped[bool] = mapped_column(Boolean, default=False)
+    tipo: Mapped[str] = mapped_column(String(50), default="otro")
+    confianza: Mapped[float] = mapped_column(default=0.0)
+    razonamiento_si: Mapped[str] = mapped_column(Text, default="")
+    razonamiento_no: Mapped[str] = mapped_column(Text, default="")
+    veredicto_final: Mapped[str] = mapped_column(Text, default="")
+    reglas_sugeridas_json: Mapped[str] = mapped_column(Text, default="[]")
+
+    # Decision humana
+    estado: Mapped[str] = mapped_column(String(20), index=True, default="pendiente")  # pendiente | aprobado | rechazado
+    human_decision_es_cotizacion: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    human_motivo: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # Contexto/pista que el humano le pasa a Claude antes de decidir (puede
+    # disparar un reanalisis con esta informacion adicional).
+    contexto_humano: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    classified_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class LearnedRule(Base):
+    """Regla aprendida y aprobada por un humano a partir de sugerencia de Claude.
+    Se aplica en los filtros determinsticos en cada nueva corrida del run."""
+    __tablename__ = "learned_rules"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tipo: Mapped[str] = mapped_column(String(40), index=True)
+    valor: Mapped[str] = mapped_column(String(500))
+    razon: Mapped[str] = mapped_column(Text, default="")
+    fuente_graph_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    aprobada_por: Mapped[str] = mapped_column(String(120), default="UI")
+    aprobada_en: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    activa: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
 class QuoteRelatedMessage(Base):
     """Fase B: correo relacionado (RE/RV) a una cotizacion. Los originales viven
     en quote_requests (1 fila = 1 cotizacion); aqui viven los correos de la cadena
@@ -233,6 +287,9 @@ def _migrar_columnas(engine) -> None:
         "quote_related_messages": [
             ("internet_message_id", "VARCHAR(998)"),
             ("relation_type", "VARCHAR(30)"),
+        ],
+        "claude_reviews": [
+            ("contexto_humano", "TEXT"),
         ],
     }
     with engine.begin() as conn:
@@ -365,6 +422,234 @@ def upsert_related(
     existing.processed_at = datetime.utcnow()
     session.commit()
     return es_nueva
+
+
+def serialize_message(msg) -> str:
+    """Serializa un Message a JSON para almacenarlo en claude_reviews y poder
+    reconstruirlo al momento de la aprobacion humana."""
+    data = {
+        "id": msg.id,
+        "mailbox": msg.mailbox,
+        "conversation_id": msg.conversation_id,
+        "internet_message_id": msg.internet_message_id,
+        "subject": msg.subject,
+        "sender_email": msg.sender_email,
+        "sender_name": msg.sender_name,
+        "received_at": msg.received_at,
+        "body_preview": msg.body_preview,
+        "body_text": msg.body_text,
+        "has_attachments": msg.has_attachments,
+        "attachments": [
+            {"id": a.id, "name": a.name, "content_type": a.content_type,
+             "size": a.size, "local_path": str(a.local_path)}
+            for a in msg.attachments
+        ],
+        "was_replied": msg.was_replied,
+        "replied_at": msg.replied_at,
+        "external_client": msg.external_client,
+        "is_forwarded_internal": msg.is_forwarded_internal,
+        "original_received_at": msg.original_received_at,
+        "original_snippet": msg.original_snippet,
+        "original_source": msg.original_source,
+        "doc_ref": msg.doc_ref,
+        "group_key": msg.group_key,
+        "is_original": msg.is_original,
+        "original_graph_id": msg.original_graph_id,
+        "chain_source": msg.chain_source,
+    }
+    return json.dumps(data, ensure_ascii=False)
+
+
+def deserialize_message(blob: str):
+    """Reconstruye un Message desde el JSON guardado en claude_reviews."""
+    from pathlib import Path
+    from .mail_reader import Message, Attachment
+    d = json.loads(blob)
+    attachments = [
+        Attachment(
+            id=a["id"], name=a["name"], content_type=a["content_type"],
+            size=a["size"], local_path=Path(a["local_path"]),
+        )
+        for a in d.get("attachments", [])
+    ]
+    return Message(
+        id=d["id"],
+        mailbox=d["mailbox"],
+        conversation_id=d["conversation_id"],
+        internet_message_id=d.get("internet_message_id") or "",
+        subject=d["subject"],
+        sender_email=d["sender_email"],
+        sender_name=d["sender_name"],
+        received_at=d["received_at"],
+        body_preview=d.get("body_preview", ""),
+        body_text=d.get("body_text", ""),
+        has_attachments=d.get("has_attachments", False),
+        attachments=attachments,
+        was_replied=d.get("was_replied", False),
+        replied_at=d.get("replied_at"),
+        external_client=d.get("external_client"),
+        is_forwarded_internal=d.get("is_forwarded_internal", False),
+        original_received_at=d.get("original_received_at"),
+        original_snippet=d.get("original_snippet"),
+        original_source=d.get("original_source"),
+        doc_ref=d.get("doc_ref"),
+        group_key=d.get("group_key"),
+        is_original=d.get("is_original", True),
+        original_graph_id=d.get("original_graph_id"),
+        chain_source=d.get("chain_source", "directo"),
+    )
+
+
+def upsert_claude_review(session: Session, msg, veredicto) -> ClaudeReview:
+    """Inserta/actualiza el veredicto de Claude para un correo. Si ya hay un
+    veredicto previo en estado 'pendiente', lo sobrescribe; si esta aprobado/rechazado,
+    no se toca."""
+    existing = session.get(ClaudeReview, msg.id)
+    if existing is not None and existing.estado != "pendiente":
+        return existing
+    if existing is None:
+        existing = ClaudeReview(graph_id=msg.id)
+        session.add(existing)
+    existing.mailbox = msg.mailbox
+    existing.subject = msg.subject
+    existing.sender_email = msg.sender_email
+    existing.received_at = msg.received_at
+    existing.internet_message_id = msg.internet_message_id
+    existing.message_json = serialize_message(msg)
+    existing.es_cotizacion_cliente = bool(veredicto.es_cotizacion_cliente)
+    existing.tipo = veredicto.tipo
+    existing.confianza = float(veredicto.confianza)
+    existing.razonamiento_si = veredicto.razonamiento_si
+    existing.razonamiento_no = veredicto.razonamiento_no
+    existing.veredicto_final = veredicto.veredicto_final
+    existing.reglas_sugeridas_json = json.dumps(
+        [r.model_dump() for r in veredicto.reglas_sugeridas], ensure_ascii=False
+    )
+    existing.estado = "pendiente"
+    existing.classified_at = datetime.utcnow()
+    session.commit()
+    return existing
+
+
+def update_claude_review_con_contexto(
+    session: Session, msg, veredicto, contexto_humano: str
+) -> ClaudeReview:
+    """Actualiza un review existente con un nuevo veredicto que tuvo en cuenta
+    un contexto humano. Lo deja como 'pendiente' (humano aun debe aprobar)."""
+    review = upsert_claude_review(session, msg, veredicto)
+    review.contexto_humano = contexto_humano
+    session.commit()
+    return review
+
+
+def get_pending_reviews(session: Session, limit: int = 100) -> list[ClaudeReview]:
+    """Lista los reviews que esperan decision humana."""
+    return session.execute(
+        select(ClaudeReview)
+        .where(ClaudeReview.estado == "pendiente")
+        .order_by(ClaudeReview.classified_at)
+        .limit(limit)
+    ).scalars().all()
+
+
+def record_human_decision(
+    session: Session,
+    graph_id: str,
+    es_cotizacion: bool,
+    motivo: str,
+    reviewed_by: str = "UI",
+) -> ClaudeReview | None:
+    """Marca el review como aprobado o rechazado por un humano."""
+    review = session.get(ClaudeReview, graph_id)
+    if review is None:
+        return None
+    review.human_decision_es_cotizacion = es_cotizacion
+    review.human_motivo = motivo or ""
+    review.reviewed_by = reviewed_by
+    review.reviewed_at = datetime.utcnow()
+    review.estado = "aprobado" if es_cotizacion else "rechazado"
+    session.commit()
+    return review
+
+
+def add_learned_rule(
+    session: Session,
+    tipo: str,
+    valor: str,
+    razon: str,
+    fuente_graph_id: str | None,
+    aprobada_por: str = "UI",
+) -> LearnedRule:
+    """Registra una regla aprendida (aprobada por humano a partir de sugerencia de Claude)."""
+    existing = session.execute(
+        select(LearnedRule).where(
+            LearnedRule.tipo == tipo,
+            LearnedRule.valor == valor,
+            LearnedRule.activa.is_(True),
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+    rule = LearnedRule(
+        tipo=tipo,
+        valor=valor,
+        razon=razon,
+        fuente_graph_id=fuente_graph_id,
+        aprobada_por=aprobada_por,
+        aprobada_en=datetime.utcnow(),
+        activa=True,
+    )
+    session.add(rule)
+    session.commit()
+    return rule
+
+
+def get_active_learned_rules(session: Session) -> list[LearnedRule]:
+    return session.execute(
+        select(LearnedRule).where(LearnedRule.activa.is_(True))
+    ).scalars().all()
+
+
+def apply_learned_rules_to_settings(session: Session, settings) -> None:
+    """Mezcla las reglas aprendidas activas con las del settings.yaml in-place.
+    Los tipos 'supplier_email' y 'supplier_phrase' se traducen a las listas de
+    exclusion existentes (no requieren columna nueva)."""
+    for rule in get_active_learned_rules(session):
+        if rule.tipo == "keyword":
+            if rule.valor not in settings.keywords:
+                settings.keywords.append(rule.valor)
+        elif rule.tipo == "exclude_subject_contains":
+            if rule.valor not in settings.exclude_subject_contains:
+                settings.exclude_subject_contains.append(rule.valor)
+        elif rule.tipo == "exclude_body_contains":
+            if rule.valor not in settings.exclude_body_contains:
+                settings.exclude_body_contains.append(rule.valor)
+        elif rule.tipo in ("exclude_sender_domain", "exclude_sender_email", "supplier_email"):
+            if rule.valor not in settings.exclude_sender_domains:
+                settings.exclude_sender_domains.append(rule.valor)
+        elif rule.tipo == "supplier_phrase":
+            if rule.valor not in settings.exclude_body_contains:
+                settings.exclude_body_contains.append(rule.valor)
+
+
+def get_recent_human_examples(session: Session, limit: int = 12) -> list[dict]:
+    """Decisiones humanas recientes para inyectarlas como ejemplos few-shot en el
+    system prompt de Claude (cierra el loop de aprendizaje)."""
+    rows = session.execute(
+        select(ClaudeReview)
+        .where(ClaudeReview.estado.in_(["aprobado", "rechazado"]))
+        .order_by(ClaudeReview.reviewed_at.desc())
+        .limit(limit)
+    ).scalars().all()
+    return [
+        {
+            "subject": r.subject,
+            "sender_email": r.sender_email,
+            "decision": "ES cotizacion" if r.human_decision_es_cotizacion else "NO es cotizacion",
+            "motivo": (r.human_motivo or "").strip()[:200],
+        }
+        for r in rows
+    ]
 
 
 def find_by_imid(
