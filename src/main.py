@@ -31,7 +31,9 @@ from .storage import (
     QuoteRelatedMessage,
     QuoteRequestRow,
     apply_learned_rules_to_settings,
+    find_by_conversation,
     find_by_imid,
+    merge_duplicate_threads,
     get_pending_reviews,
     get_recent_human_examples,
     get_skip_ids,
@@ -86,9 +88,27 @@ def _setup_logging(level: str) -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-def guardar_aprobada(session: Session, msg: Message) -> QuoteRequestRow:
-    """Wrapper publico para que el UI pueda guardar una cotizacion aprobada por
-    un humano. Delega en _guardar (idempotente por graph_id)."""
+def guardar_aprobada(session: Session, msg: Message) -> QuoteRequestRow | None:
+    """Wrapper publico para que el UI guarde una cotizacion aprobada por un humano.
+    Aplica el MISMO dedup que el pipeline run() para no crear cotizaciones
+    duplicadas al aprobar varios correos del mismo hilo/correo:
+      1. ya existe por graph_id          -> actualiza la cotizacion.
+      2. mismo correo en otro buzon (imid) -> lo cuelga como copia_buzon.
+      3. mismo hilo en el buzon (conv_id)  -> lo cuelga como copia_hilo.
+      4. en otro caso                     -> es una cotizacion nueva.
+    Devuelve la cotizacion (padre) afectada, o None si no se pudo resolver."""
+    if upsert_quote(session, msg.id) is not None:
+        return _guardar(session, msg)
+    padre_imid = find_by_imid(session, msg.internet_message_id)
+    if padre_imid is not None:
+        upsert_related(session, msg, padre_imid, relation_type="copia_buzon")
+        return session.get(QuoteRequestRow, padre_imid)
+    padre_conv = find_by_conversation(
+        session, msg.mailbox, msg.conversation_id, exclude_graph_id=msg.id
+    )
+    if padre_conv is not None:
+        upsert_related(session, msg, padre_conv, relation_type="copia_hilo")
+        return session.get(QuoteRequestRow, padre_conv)
     return _guardar(session, msg)
 
 
@@ -243,6 +263,7 @@ def run(
                 re_nuevas = 0
                 re_actualizadas = 0
                 copias_buzon = 0
+                copias_hilo = 0
                 claude_clasificados = 0
                 claude_no_aplicado = 0
                 limbo_re: list[str] = []
@@ -299,6 +320,25 @@ def run(
                                 "identificado", "copia_buzon",
                             )
                             copias_buzon += 1
+                            continue
+                        # Dedup por hilo: mismo conversation_id en el mismo buzon =
+                        # mismo hilo de cotizacion reenviado por varios colaboradores
+                        # internos. El primero es la cotizacion; los demas se guardan
+                        # como correos relacionados (copia_hilo).
+                        padre_conv = find_by_conversation(
+                            session, msg.mailbox, msg.conversation_id,
+                            exclude_graph_id=msg.id,
+                        )
+                        if padre_conv is not None:
+                            upsert_related(
+                                session, msg, padre_conv,
+                                relation_type="copia_hilo",
+                            )
+                            mark_processed(
+                                session, msg.id, mailbox, msg.subject,
+                                "identificado", "copia_hilo",
+                            )
+                            copias_hilo += 1
                             continue
                         # Realmente nueva cotizacion
                         _guardar(session, msg)
@@ -405,6 +445,12 @@ def run(
                     console.print(
                         f"    [bold magenta]Copias cross-mailbox:[/bold magenta] "
                         f"{copias_buzon} correo(s) que ya estaban registrados en otro buzon"
+                    )
+                if copias_hilo:
+                    console.print(
+                        f"    [bold magenta]Copias del mismo hilo:[/bold magenta] "
+                        f"{copias_hilo} reenvio(s) del mismo hilo ya registrado "
+                        f"(guardados como relacionados)"
                     )
                 if claude_clasificados:
                     console.print(
@@ -804,6 +850,70 @@ def cleanup(
     console.print(
         f"[bold green]Listo:[/bold green] {len(candidatos)} fila(s) eliminada(s) "
         f"de quote_requests."
+    )
+
+
+@app.command("dedup-threads")
+def dedup_threads(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Solo mostrar que se fusionaria, sin tocar la BD."
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Saltar confirmacion (no interactivo)."
+    ),
+) -> None:
+    """Fusiona cotizaciones DUPLICADAS del mismo hilo: cuando el mismo hilo de
+    cotizacion (mismo conversation_id en el mismo buzon) fue reenviado por varios
+    colaboradores internos y quedo como varias filas en quote_requests, conserva
+    la mas antigua como cotizacion y mueve las demas a quote_related_messages
+    (relation_type='copia_hilo'). Idempotente."""
+    settings = load_settings()
+    _setup_logging(settings.log_level)
+    engine = init_db(settings.database_path)
+
+    with Session(engine) as session:
+        plan = merge_duplicate_threads(session, dry_run=True)
+
+    if not plan:
+        console.print(
+            "[green]No hay cotizaciones duplicadas por hilo que fusionar.[/green]"
+        )
+        raise typer.Exit(code=0)
+
+    table = Table(title="Duplicados del mismo hilo a fusionar", show_lines=True)
+    table.add_column("Buzon", overflow="fold", max_width=24)
+    table.add_column("Conserva (#)", justify="right")
+    table.add_column("Mueve a relacionados (#)", justify="right")
+    table.add_column("Asunto", overflow="fold", max_width=44)
+    for p in plan:
+        table.add_row(
+            p["mailbox"],
+            f"#{p['canonical_id']}",
+            f"#{p['dup_id']}",
+            (p["dup_subject"] or "")[:55],
+        )
+    console.print(table)
+    console.print(
+        f"\n[bold]{len(plan)}[/bold] fila(s) se moverian de quote_requests a "
+        f"quote_related_messages (copia_hilo)."
+    )
+
+    if dry_run:
+        console.print("\n[dim](dry-run: no se toco la BD.)[/dim]")
+        raise typer.Exit(code=0)
+
+    if not yes:
+        if not typer.confirm(
+            f"\nFusionar {len(plan)} duplicado(s)?", default=False
+        ):
+            console.print("[yellow]Cancelado.[/yellow]")
+            raise typer.Exit(code=0)
+
+    with Session(engine) as session:
+        realizadas = merge_duplicate_threads(session, dry_run=False)
+    console.print(
+        f"[bold green]Listo:[/bold green] {len(realizadas)} duplicado(s) "
+        f"fusionado(s) como copia_hilo."
     )
 
 

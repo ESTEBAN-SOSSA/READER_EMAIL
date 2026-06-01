@@ -652,6 +652,104 @@ def get_recent_human_examples(session: Session, limit: int = 12) -> list[dict]:
     ]
 
 
+def find_by_conversation(
+    session: Session,
+    mailbox: str,
+    conversation_id: str,
+    exclude_graph_id: str | None = None,
+) -> int | None:
+    """Busca una cotizacion existente en el MISMO buzon y mismo hilo
+    (conversation_id) y devuelve su quote_request_id (la mas antigua si hay varias).
+
+    Sirve para deduplicar el caso en que el mismo hilo de cotizacion es reenviado
+    por varios colaboradores internos al mismo buzon: cada reenvio tiene un
+    internet_message_id distinto (por eso find_by_imid no lo atrapa), pero todos
+    comparten el conversation_id. El primero queda como la cotizacion (original) y
+    los demas se guardan como quote_related_messages (relation_type='copia_hilo')."""
+    if not conversation_id:
+        return None
+    stmt = select(QuoteRequestRow.id).where(
+        QuoteRequestRow.mailbox == mailbox,
+        QuoteRequestRow.conversation_id == conversation_id,
+    )
+    if exclude_graph_id:
+        stmt = stmt.where(QuoteRequestRow.graph_id != exclude_graph_id)
+    return session.execute(
+        stmt.order_by(QuoteRequestRow.received_at).limit(1)
+    ).scalar_one_or_none()
+
+
+def merge_duplicate_threads(session: Session, dry_run: bool = False) -> list[dict]:
+    """Fusiona quote_requests que comparten (mailbox, conversation_id): conserva la
+    mas antigua como cotizacion (original) y mueve las demas a
+    quote_related_messages (relation_type='copia_hilo'). Idempotente: si cada hilo
+    ya tiene una sola cotizacion, no hace nada. Devuelve el plan de fusiones.
+
+    Util para purgar duplicados legacy creados antes de activar el dedup por hilo
+    (mismo hilo reenviado por varios colaboradores internos al mismo buzon)."""
+    from collections import defaultdict
+
+    rows = session.execute(
+        select(QuoteRequestRow).order_by(QuoteRequestRow.received_at)
+    ).scalars().all()
+    grupos: dict[tuple[str, str], list[QuoteRequestRow]] = defaultdict(list)
+    for r in rows:
+        if r.conversation_id:
+            grupos[(r.mailbox, r.conversation_id)].append(r)
+
+    plan: list[dict] = []
+    for (mailbox, conv), miembros in grupos.items():
+        if len(miembros) < 2:
+            continue
+        miembros.sort(key=lambda x: x.received_at or "")
+        canonical = miembros[0]
+        for dup in miembros[1:]:
+            plan.append({
+                "mailbox": mailbox,
+                "conversation_id": conv,
+                "canonical_id": canonical.id,
+                "dup_id": dup.id,
+                "dup_subject": dup.subject,
+                "dup_was_replied": dup.was_replied,
+            })
+            if dry_run:
+                continue
+            # Propagar estado respondido al canonical (el original manda)
+            if dup.was_replied and not canonical.was_replied:
+                canonical.was_replied = True
+                canonical.replied_at = dup.replied_at or canonical.replied_at
+                canonical.external_client = (
+                    canonical.external_client or dup.external_client
+                )
+            # Re-apuntar relacionados que colgaban del duplicado hacia el canonical
+            for child in session.execute(
+                select(QuoteRelatedMessage).where(
+                    QuoteRelatedMessage.quote_request_id == dup.id
+                )
+            ).scalars().all():
+                child.quote_request_id = canonical.id
+            # Guardar el duplicado como correo relacionado del canonical
+            if session.get(QuoteRelatedMessage, dup.graph_id) is None:
+                session.add(QuoteRelatedMessage(
+                    graph_id=dup.graph_id,
+                    quote_request_id=canonical.id,
+                    mailbox=dup.mailbox,
+                    conversation_id=dup.conversation_id,
+                    subject=dup.subject,
+                    sender_email=dup.sender_email,
+                    sender_name=dup.sender_name,
+                    received_at=dup.received_at,
+                    snippet=dup.snippet,
+                    is_forwarded_internal=dup.is_forwarded_internal,
+                    internet_message_id=dup.internet_message_id,
+                    relation_type="copia_hilo",
+                ))
+            session.delete(dup)
+    if not dry_run:
+        session.commit()
+    return plan
+
+
 def find_by_imid(
     session: Session, internet_message_id: str | None
 ) -> int | None:
