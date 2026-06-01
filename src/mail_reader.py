@@ -111,6 +111,16 @@ def _inicio_de_hoy_utc() -> str:
     return inicio_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _inicio_de_dia_utc(fecha_iso: str) -> str:
+    """Inicio (00:00) de una fecha local de Colombia (YYYY-MM-DD) en UTC ISO 8601.
+    Permite leer un rango 'desde esta fecha hasta ahora' (p. ej. un lunes leer
+    desde el viernes anterior para cubrir el fin de semana)."""
+    col = timezone(timedelta(hours=-5))
+    d = datetime.strptime(fecha_iso.strip(), "%Y-%m-%d")
+    inicio_local = d.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=col)
+    return inicio_local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _cuerpo_a_texto(msg: dict) -> str:
     """Texto plano del cuerpo de un mensaje de Graph (quita HTML)."""
     body_obj = msg.get("body") or {}
@@ -292,7 +302,13 @@ class MailReader:
         filters: list[str] = []
         if self.settings.unread_only:
             filters.append("isRead eq false")
-        if self.settings.only_today:
+        if self.settings.since_date:
+            # Rango explicito: desde esta fecha (local CO) hasta ahora. Tiene
+            # prioridad sobre only_today (p. ej. lunes leyendo desde el viernes).
+            filters.append(
+                f"receivedDateTime ge {_inicio_de_dia_utc(self.settings.since_date)}"
+            )
+        elif self.settings.only_today:
             filters.append(f"receivedDateTime ge {_inicio_de_hoy_utc()}")
         if filters:
             params["$filter"] = " and ".join(filters)

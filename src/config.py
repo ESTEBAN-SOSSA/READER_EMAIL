@@ -21,6 +21,7 @@ class Settings:
     max_messages_per_mailbox: int
     unread_only: bool
     only_today: bool
+    since_date: str  # YYYY-MM-DD (local CO): lee desde esta fecha hasta ahora; "" = desactivado
     attachments_dir: Path
     database_path: Path
     log_level: str
@@ -65,6 +66,7 @@ def load_settings(settings_path: Path | None = None) -> Settings:
         max_messages_per_mailbox=int(os.getenv("MAX_MESSAGES_PER_MAILBOX", "50")),
         unread_only=os.getenv("UNREAD_ONLY", "true").lower() == "true",
         only_today=os.getenv("ONLY_TODAY", "false").lower() == "true",
+        since_date=os.getenv("SINCE_DATE", "").strip(),
         attachments_dir=ROOT / os.getenv("ATTACHMENTS_DIR", "./attachments"),
         database_path=ROOT / os.getenv("DATABASE_PATH", "./data/reader_email.db"),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
