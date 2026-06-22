@@ -268,19 +268,48 @@ def _localizar_primer_externo(
     return None
 
 
+# Patrones de numero de referencia que SOBREVIVEN a un reenvio (aparecen igual en
+# el correo original del cliente y en el RV/RE que el despachador manda al analista).
+# Son la llave de cruce mas confiable original<->reenvio. Orden = no importa; se
+# extraen TODOS y el match se hace por interseccion de conjuntos.
+_PATRONES_REFERENCIA = [
+    r"\b\d{8,12}\b",                              # SAP / orden / sourcing: 6000149870, 5120117227
+    r"\b[A-Z]{2,5}(?:-[A-Z0-9]{2,6}){1,3}\b",    # COL-7087, COL-FM, CA-MB-ABA-0091
+    r"#\s?(\d{4,6})\b",                           # Cemex sourcing event #7087 / #7131
+]
+
+
+def extraer_referencias(subject: str, body: str = "", pattern: str = "") -> list[str]:
+    """Extrae TODOS los numeros de documento/solicitud de un correo (asunto + cuerpo).
+    Cada uno es un identificador estable (orden SAP, sourcing event, etc.) que viaja
+    sin cambios al reenviarse, asi que sirve para casar el reenvio interno con la
+    solicitud original del cliente. Devuelve la lista normalizada (mayuscula, sin
+    espacios) y deduplicada. `pattern` (group_reference_regex del settings) se agrega
+    como patron extra opcional."""
+    texto = f"{subject or ''}\n{body or ''}"
+    patrones = list(_PATRONES_REFERENCIA)
+    if pattern:
+        patrones.append(pattern)
+    refs: list[str] = []
+    for p in patrones:
+        try:
+            rx = re.compile(p, re.IGNORECASE)
+        except re.error:
+            logger.warning("patron de referencia invalido: %s", p)
+            continue
+        for m in rx.finditer(texto):
+            ref = (m.group(1) if m.groups() else m.group(0)).upper().replace(" ", "")
+            if ref and ref not in refs:
+                refs.append(ref)
+    return refs
+
+
 def _extraer_referencia(subject: str, body: str, pattern: str) -> str | None:
-    """Extrae el numero de documento/solicitud (p. ej. 'OPM-20260527') que agrupa
-    varios correos de una misma cotizacion consolidada. Devuelve None si no hay
-    patron configurado o no se halla coincidencia. Busca primero en el asunto."""
-    if not pattern:
-        return None
-    try:
-        rx = re.compile(pattern)
-    except re.error:
-        logger.warning("group_reference_regex invalido: %s", pattern)
-        return None
-    m = rx.search(subject or "") or rx.search(body or "")
-    return m.group(0).upper() if m else None
+    """Compat: serializa TODAS las referencias halladas en un solo string ordenado y
+    separado por ';' (asi una sola columna `doc_ref` admite varias refs y el cruce
+    se hace por interseccion). Devuelve None si no se halla ninguna."""
+    refs = extraer_referencias(subject, body, pattern)
+    return ";".join(sorted(refs)) if refs else None
 
 
 class MailReader:

@@ -23,7 +23,7 @@ if sys.platform == "win32":
 
 from .config import load_settings
 from .graph_client import GraphClient
-from .mail_reader import MailReader, Message
+from .mail_reader import MailReader, Message, extraer_referencias
 from .storage import (
     ClaudeReview,
     LearnedRule,
@@ -31,8 +31,18 @@ from .storage import (
     QuoteRelatedMessage,
     QuoteRequestRow,
     apply_learned_rules_to_settings,
+    clave_grupo_logico,
     find_by_conversation,
     find_by_imid,
+    find_claude_review_by_imid,
+    find_review_by_group,
+    registrar_copia_logica,
+    enlazar_reenvios_internos,
+    aprobar_enlace_candidato,
+    descartar_enlace_candidato,
+    find_claude_review_by_reference,
+    consolidar_staging_por_referencia,
+    ReenvioLinkCandidato,
     merge_duplicate_threads,
     get_pending_reviews,
     get_recent_human_examples,
@@ -266,6 +276,9 @@ def run(
                 copias_hilo = 0
                 claude_clasificados = 0
                 claude_no_aplicado = 0
+                claude_copias_buzon = 0
+                claude_copias_logicas = 0
+                claude_copias_referencia = 0
                 limbo_re: list[str] = []
                 backfill_errores: list[tuple[str, str]] = []
                 if not dry_run:
@@ -278,6 +291,60 @@ def run(
                             if session.get(ClaudeReview, m.id) is None
                         ]
                         for msg in a_clasificar:
+                            # Dedup cross-buzon EN EL STAGING: si este mismo correo
+                            # (internet_message_id) ya tiene un review — de otro
+                            # buzon interceptado o de antes en esta corrida — no se
+                            # reclasifica ni se duplica en la cola de revision. El
+                            # mismo correo a varios destinatarios trae igual
+                            # Message-ID pero distinto graph_id y receivedDateTime
+                            # por buzon (de ahi los "duplicados con diferencia de ms").
+                            if (
+                                msg.internet_message_id
+                                and find_claude_review_by_imid(
+                                    session, msg.internet_message_id
+                                ) is not None
+                            ):
+                                mark_processed(
+                                    session, msg.id, mailbox, msg.subject,
+                                    "descartado", "copia_buzon_claude",
+                                )
+                                claude_copias_buzon += 1
+                                continue
+                            # Dedup LOGICO: correos equivalentes (mismo asunto
+                            # normalizado + remitente) aunque con Message-ID y
+                            # conversation distintos (un despachador reenvia N veces
+                            # la misma peticion de un portal). Solo el REPRESENTANTE
+                            # se clasifica y se revisa; las copias heredan su decision.
+                            gkey = clave_grupo_logico(msg.subject, msg.sender_email)
+                            rep = find_review_by_group(session, gkey) if gkey else None
+                            if rep is not None:
+                                reason = registrar_copia_logica(session, msg, rep)
+                                if reason == "copia_logica_pendiente":
+                                    mark_processed(
+                                        session, msg.id, mailbox, msg.subject,
+                                        "identificado", "copia_logica_pendiente",
+                                    )
+                                claude_copias_logicas += 1
+                                continue
+                            # Dedup por REFERENCIA: el mismo RFQ (mismo numero de
+                            # orden/sourcing) que llega de remitentes DISTINTOS (cliente
+                            # directo + varios despachadores) no lo agrupa copia_logica
+                            # (que keya en remitente). Si ya hay un review con esa
+                            # referencia, esta copia hereda su decision sin gastar Claude.
+                            refs_msg = extraer_referencias(msg.subject, msg.body_text or "")
+                            rep_ref = (
+                                find_claude_review_by_reference(session, refs_msg)
+                                if refs_msg else None
+                            )
+                            if rep_ref is not None:
+                                reason = registrar_copia_logica(session, msg, rep_ref)
+                                if reason == "copia_logica_pendiente":
+                                    mark_processed(
+                                        session, msg.id, mailbox, msg.subject,
+                                        "identificado", "copia_referencia_pendiente",
+                                    )
+                                claude_copias_referencia += 1
+                                continue
                             if claude_calls_realizadas >= max_claude_calls:
                                 claude_no_aplicado += 1
                                 continue
@@ -457,6 +524,23 @@ def run(
                         f"    [bold cyan]Clasificados por Claude (pendientes humano):[/bold cyan] "
                         f"{claude_clasificados}"
                     )
+                if claude_copias_buzon:
+                    console.print(
+                        f"    [bold magenta]Copias cross-buzon dedup (mismo Message-ID):[/bold magenta] "
+                        f"{claude_copias_buzon} correo(s) ya en la cola desde otro buzon"
+                    )
+                if claude_copias_logicas:
+                    console.print(
+                        f"    [bold magenta]Copias logicas dedup (mismo asunto+remitente):[/bold magenta] "
+                        f"{claude_copias_logicas} correo(s) agrupados a un representante "
+                        f"(no se re-clasifican ni se re-muestran)"
+                    )
+                if claude_copias_referencia:
+                    console.print(
+                        f"    [bold magenta]Copias por referencia dedup (mismo RFQ, remitente distinto):[/bold magenta] "
+                        f"{claude_copias_referencia} correo(s) heredan la decision del "
+                        f"representante (sin gastar Claude)"
+                    )
                 if claude_no_aplicado:
                     console.print(
                         f"    [yellow]Claude no aplicado en {claude_no_aplicado} correo(s) "
@@ -479,6 +563,50 @@ def run(
                 _mostrar_dashboard_db(
                     session, mailbox, nuevas, actualizadas, len(descartados)
                 )
+
+    # Consolidacion post-corrida (idempotente):
+    if not dry_run:
+        with Session(engine) as _sc:
+            # 1) Limpia la cola de revision: colapsa duplicados del mismo RFQ que
+            #    llegaron de remitentes distintos (referencia compartida).
+            staging_colapsados = consolidar_staging_por_referencia(_sc)
+            # 2) Fusiona duplicados del mismo hilo (mismo conversation_id) que pudieron
+            #    quedar por aprobaciones en la UI con codigo viejo.
+            hilos_fusionados = len(merge_duplicate_threads(_sc, dry_run=False))
+        if staging_colapsados:
+            console.print(
+                f"\n[bold magenta]Cola de revision depurada:[/bold magenta] "
+                f"{staging_colapsados} duplicado(s) cross-remitente colapsados a su representante."
+            )
+        if hilos_fusionados:
+            console.print(
+                f"[bold magenta]Duplicados del mismo hilo fusionados:[/bold magenta] "
+                f"{hilos_fusionados} (copia_hilo)."
+            )
+
+    # Reconciliacion CROSS-BUZON: enlaza reenvios internos de analistas (sin cliente
+    # externo) con la solicitud original del cliente en el buzon del despachador.
+    if not dry_run:
+        with Session(engine) as _sl:
+            enlace = enlazar_reenvios_internos(_sl)
+        if enlace["auto"]:
+            console.print(
+                f"\n[bold green]Consolidacion por referencia:[/bold green] "
+                f"{len(enlace['auto'])} cotizacion(es) duplicada(s) del mismo RFQ "
+                f"bajaron a sub-tabla del canonical (cross-remitente/cross-analista)."
+            )
+            for e in enlace["auto"][:8]:
+                console.print(
+                    f"    [dim]#{e['dup_id']} ({e['rel']}) ref={','.join(e['ref'])} "
+                    f"-> canonical #{e['orig_id']} cliente={e['cliente']}[/dim]"
+                )
+        if enlace["manual"]:
+            console.print(
+                f"\n[bold yellow]Enlaces por asunto (requieren tu validacion):[/bold yellow] "
+                f"{len(enlace['manual'])} candidato(s) en cola. "
+                f"Revisa con [cyan]list-link-candidatos[/cyan] y aprueba con "
+                f"[cyan]aprobar-enlace <id>[/cyan]."
+            )
 
     # Reporte global de revisiones pendientes (si Claude esta activo)
     if clasificador is not None:
@@ -915,6 +1043,123 @@ def dedup_threads(
         f"[bold green]Listo:[/bold green] {len(realizadas)} duplicado(s) "
         f"fusionado(s) como copia_hilo."
     )
+
+
+@app.command("enlazar-reenvios")
+def enlazar_reenvios(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Solo mostrar que se enlazaria, sin tocar la BD."
+    ),
+) -> None:
+    """Reconciliacion CROSS-BUZON: une el reenvio interno de un analista (sin cliente
+    externo) con la solicitud ORIGINAL del cliente que vive en el buzon del despachador.
+    El original es la cotizacion de record; el reenvio baja a quote_related_messages
+    (reenvio_interno). Los matches por numero de referencia se aplican solos; los de
+    solo-asunto van a una cola de validacion manual. Idempotente."""
+    settings = load_settings()
+    _setup_logging(settings.log_level)
+    engine = init_db(settings.database_path)
+
+    with Session(engine) as session:
+        res = enlazar_reenvios_internos(session, dry_run=dry_run)
+
+    if not res["auto"] and not res["manual"]:
+        console.print("[green]No hay reenvios internos huerfanos por enlazar.[/green]")
+        raise typer.Exit(code=0)
+
+    if res["auto"]:
+        table = Table(title="Consolidacion por REFERENCIA (alta confianza)", show_lines=True)
+        table.add_column("Duplicado (#)", justify="right")
+        table.add_column("Relacion")
+        table.add_column("Referencia")
+        table.add_column("-> Canonical (#)", justify="right")
+        table.add_column("Cliente", overflow="fold", max_width=24)
+        for e in res["auto"]:
+            table.add_row(
+                f"#{e['dup_id']} [{e['dup_mailbox'][:14]}]", e["rel"], ",".join(e["ref"]),
+                f"#{e['orig_id']} [{e['orig_mailbox'][:14]}]", e["cliente"] or "",
+            )
+        console.print(table)
+
+    if res["manual"]:
+        table = Table(title="Candidatos por ASUNTO (requieren validacion)", show_lines=True)
+        table.add_column("RV (#)", justify="right")
+        table.add_column("Original (#)", justify="right")
+        table.add_column("Asunto normalizado", overflow="fold", max_width=40)
+        table.add_column("Cliente del original", overflow="fold", max_width=26)
+        for e in res["manual"]:
+            table.add_row(
+                f"#{e['rv_id']}", f"#{e['orig_id']}", e["asunto"], e["cliente"] or "",
+            )
+        console.print(table)
+
+    if dry_run:
+        console.print("\n[dim](dry-run: no se toco la BD.)[/dim]")
+    else:
+        console.print(
+            f"\n[bold green]Listo:[/bold green] {len(res['auto'])} enlace(s) aplicado(s) "
+            f"por referencia; {len(res['manual'])} en cola manual "
+            f"([cyan]list-link-candidatos[/cyan])."
+        )
+
+
+@app.command("list-link-candidatos")
+def list_link_candidatos() -> None:
+    """Lista la cola de validacion manual de enlaces reenvio<->original (por asunto)."""
+    settings = load_settings()
+    engine = init_db(settings.database_path)
+    with Session(engine) as session:
+        cands = session.execute(
+            select(ReenvioLinkCandidato)
+            .where(ReenvioLinkCandidato.estado == "pendiente")
+            .order_by(ReenvioLinkCandidato.id)
+        ).scalars().all()
+    if not cands:
+        console.print("[green]No hay candidatos de enlace pendientes.[/green]")
+        raise typer.Exit(code=0)
+    table = Table(title="Cola de enlace manual (reenvio <-> original)", show_lines=True)
+    table.add_column("ID", justify="right")
+    table.add_column("RV del analista", overflow="fold", max_width=34)
+    table.add_column("Original del despachador", overflow="fold", max_width=34)
+    table.add_column("Cliente a recuperar", overflow="fold", max_width=24)
+    for c in cands:
+        table.add_row(
+            f"{c.id}",
+            f"#{c.rv_quote_id} [{c.rv_mailbox}]\n{(c.rv_subject or '')[:40]}",
+            f"#{c.orig_quote_id} [{c.orig_mailbox}]\n{(c.orig_subject or '')[:40]}",
+            c.orig_external_client or "",
+        )
+    console.print(table)
+    console.print(
+        "\nAprueba con [cyan]aprobar-enlace <ID>[/cyan] o descarta con "
+        "[cyan]descartar-enlace <ID>[/cyan]."
+    )
+
+
+@app.command("aprobar-enlace")
+def aprobar_enlace(candidato_id: int = typer.Argument(..., help="ID del candidato.")) -> None:
+    """Aprueba un enlace de la cola manual: baja el RV a reenvio del original."""
+    settings = load_settings()
+    engine = init_db(settings.database_path)
+    with Session(engine) as session:
+        ok = aprobar_enlace_candidato(session, candidato_id)
+    if ok:
+        console.print(f"[bold green]Enlace #{candidato_id} aplicado.[/bold green]")
+    else:
+        console.print(f"[yellow]Candidato #{candidato_id} no existe o ya no aplica.[/yellow]")
+
+
+@app.command("descartar-enlace")
+def descartar_enlace(candidato_id: int = typer.Argument(..., help="ID del candidato.")) -> None:
+    """Descarta un candidato de enlace de la cola manual (no son la misma cotizacion)."""
+    settings = load_settings()
+    engine = init_db(settings.database_path)
+    with Session(engine) as session:
+        ok = descartar_enlace_candidato(session, candidato_id)
+    if ok:
+        console.print(f"[dim]Candidato #{candidato_id} descartado.[/dim]")
+    else:
+        console.print(f"[yellow]Candidato #{candidato_id} no existe o ya no aplica.[/yellow]")
 
 
 @app.command("list-threads")

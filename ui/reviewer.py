@@ -32,9 +32,11 @@ from src.storage import (
     get_recent_human_examples,
     init_db,
     mark_processed,
+    propagar_a_copias_logicas,
     record_human_decision,
     update_claude_review_con_contexto,
 )
+from sqlalchemy import func, select
 from src.main import guardar_aprobada
 
 
@@ -134,10 +136,12 @@ def _aplicar_decision(
         record_human_decision(
             session, review.graph_id, es_cotizacion, motivo, reviewed_by=reviewer
         )
+        parent_quote_id = None
         if es_cotizacion:
             try:
                 msg = deserialize_message(review.message_json)
-                guardar_aprobada(session, msg)
+                parent = guardar_aprobada(session, msg)
+                parent_quote_id = parent.id if parent else None
                 mark_processed(
                     session, review.graph_id, review.mailbox, review.subject,
                     "identificado", "aprobado_humano",
@@ -149,6 +153,15 @@ def _aplicar_decision(
             mark_processed(
                 session, review.graph_id, review.mailbox, review.subject,
                 "descartado", f"rechazado_humano: {motivo[:100]}",
+            )
+        # Propagar la MISMA decision a las copias logicas del grupo (mismo asunto
+        # + remitente reenviado varias veces): el humano revisa una sola vez.
+        n_copias = propagar_a_copias_logicas(
+            session, review.graph_id, es_cotizacion, parent_quote_id
+        )
+        if n_copias:
+            st.caption(
+                f"↳ Decisión aplicada también a {n_copias} copia(s) lógica(s) del grupo."
             )
         for regla in reglas_aprobadas:
             add_learned_rule(
@@ -225,6 +238,18 @@ with tab_pending:
 
     with Session(engine) as session:
         pendientes = get_pending_reviews(session, limit=50)
+        # Cuantas copias logicas cuelga cada representante (mismo asunto+remitente
+        # reenviado varias veces): se decide una vez y aplica a todas.
+        copias_por_rep = dict(
+            session.execute(
+                select(
+                    ClaudeReview.representante_graph_id,
+                    func.count(ClaudeReview.graph_id),
+                )
+                .where(ClaudeReview.estado == "copia_logica")
+                .group_by(ClaudeReview.representante_graph_id)
+            ).all()
+        )
 
     if not pendientes:
         st.success("✅ No hay correos pendientes de revisión. ¡Buen trabajo!")
@@ -245,6 +270,12 @@ with tab_pending:
                     f"De **{review.sender_email}** · Buzón **{review.mailbox}** · "
                     f"Recibido {review.received_at}"
                 )
+                _n_copias = copias_por_rep.get(review.graph_id, 0)
+                if _n_copias:
+                    st.caption(
+                        f"🧩 **+{_n_copias} copia(s) lógica(s)** del mismo asunto/remitente "
+                        f"reenviadas a otros buzones — tu decisión aplica a todas."
+                    )
             with col_h2:
                 st.markdown(
                     f"**{veredicto_color} {veredicto_str}**  \n"

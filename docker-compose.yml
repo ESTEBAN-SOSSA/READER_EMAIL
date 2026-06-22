@@ -44,3 +44,28 @@ services:
     restart: unless-stopped
     depends_on:
       - reader
+    # Corridas automaticas del pipeline disparadas por el scheduler (Ofelia).
+    # Se ejecutan DENTRO de este contenedor (mismo image, .env y volumen de BD),
+    # asi no hay que duplicar credenciales ni volumenes. La ejecucion manual
+    # sigue disponible aparte:  docker compose run --rm reader run
+    labels:
+      ofelia.enabled: "true"
+      # Formato Ofelia: <seg> <min> <hora> <dia-mes> <mes> <dia-sem>.
+      # 06:00 y 18:00 hora Bogota (UTC-5, sin horario de verano) = 11:00 y 23:00 UTC.
+      # El contenedor de Ofelia corre en UTC, por eso el cron va en UTC.
+      ofelia.job-exec.pipeline-6am-6pm.schedule: "0 0 11,23 * * *"
+      ofelia.job-exec.pipeline-6am-6pm.command: "python -m src.main run"
+
+  # Programador de corridas automaticas (Ofelia): lee los labels 'ofelia.*' de
+  # los contenedores via el socket de Docker y dispara el job a su hora. Se
+  # mantiene vivo. No reemplaza la ejecucion manual; la complementa.
+  scheduler:
+    image: mcuadros/ofelia:latest
+    container_name: INTERVENCION_BUZON_SCHED
+    command: daemon --docker
+    depends_on:
+      - reviewer-ui
+    volumes:
+      # Solo lectura: Ofelia necesita el socket para hacer 'exec' en reviewer-ui.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped

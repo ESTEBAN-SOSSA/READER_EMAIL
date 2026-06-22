@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -58,8 +59,10 @@ class QuoteRequestRow(Base):
     original_snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
     original_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
-    # Agrupacion de cotizaciones relacionadas / consolidadas (escenario 2)
-    doc_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Agrupacion de cotizaciones relacionadas / consolidadas (escenario 2).
+    # Puede contener VARIAS referencias separadas por ';' (un correo trae 2 ordenes);
+    # el cruce reenvio<->original se hace por interseccion de esos conjuntos.
+    doc_ref: Mapped[str | None] = mapped_column(String(200), nullable=True)
     group_key: Mapped[str | None] = mapped_column(String(255), index=True, nullable=True)
 
     # Relacion RE -> original del hilo (escenario REs)
@@ -143,6 +146,15 @@ class ClaudeReview(Base):
     # disparar un reanalisis con esta informacion adicional).
     contexto_humano: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Dedup LOGICO: agrupa correos lógicamente equivalentes (mismo asunto
+    # normalizado + remitente) aunque tengan Message-ID/conversation distintos
+    # (p.ej. un despachador reenvia 10 veces la misma petición de un portal).
+    # Solo el REPRESENTANTE del grupo se clasifica y se muestra al humano; las
+    # copias quedan como estado='copia_logica' apuntando al representante y
+    # heredan su decision (rechazo => ruido; aprobacion => se consolidan).
+    group_logico: Mapped[str | None] = mapped_column(String(700), index=True, nullable=True)
+    representante_graph_id: Mapped[str | None] = mapped_column(String(512), index=True, nullable=True)
+
     classified_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -183,6 +195,28 @@ class QuoteRelatedMessage(Base):
     # Dedup cross-mailbox + tipo de relacion explicito
     internet_message_id: Mapped[str | None] = mapped_column(String(998), index=True, nullable=True)
     relation_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+
+
+class ReenvioLinkCandidato(Base):
+    """Cola de validacion MANUAL para enlaces reenvio<->original que NO tienen un
+    numero de referencia compartido y se proponen solo por asunto normalizado (mas
+    riesgo de falso positivo). El humano confirma o descarta; los enlaces por
+    referencia se aplican solos y NO pasan por aqui."""
+    __tablename__ = "reenvio_link_candidatos"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Reenvio interno del analista (huerfano, sin cliente externo)
+    rv_quote_id: Mapped[int] = mapped_column(Integer, index=True)
+    rv_mailbox: Mapped[str] = mapped_column(String(255), default="")
+    rv_subject: Mapped[str] = mapped_column(String(1024), default="")
+    # Original del despachador (candidato, trae el cliente externo)
+    orig_quote_id: Mapped[int] = mapped_column(Integer, index=True)
+    orig_mailbox: Mapped[str] = mapped_column(String(255), default="")
+    orig_subject: Mapped[str] = mapped_column(String(1024), default="")
+    orig_external_client: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    asunto_normalizado: Mapped[str] = mapped_column(String(700), default="")
+    estado: Mapped[str] = mapped_column(String(20), index=True, default="pendiente")  # pendiente | aprobado | descartado
+    creado_en: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 def init_db(path: Path):
@@ -290,6 +324,8 @@ def _migrar_columnas(engine) -> None:
         ],
         "claude_reviews": [
             ("contexto_humano", "TEXT"),
+            ("group_logico", "VARCHAR(700)"),
+            ("representante_graph_id", "VARCHAR(512)"),
         ],
     }
     with engine.begin() as conn:
@@ -526,6 +562,7 @@ def upsert_claude_review(session: Session, msg, veredicto) -> ClaudeReview:
         [r.model_dump() for r in veredicto.reglas_sugeridas], ensure_ascii=False
     )
     existing.estado = "pendiente"
+    existing.group_logico = clave_grupo_logico(msg.subject, msg.sender_email)
     existing.classified_at = datetime.utcnow()
     session.commit()
     return existing
@@ -748,6 +785,455 @@ def merge_duplicate_threads(session: Session, dry_run: bool = False) -> list[dic
     if not dry_run:
         session.commit()
     return plan
+
+
+def referencias_de(doc_ref: str | None) -> set[str]:
+    """Conjunto de referencias de un doc_ref serializado ('6000149870;COL-7087')."""
+    if not doc_ref:
+        return set()
+    return {r.strip() for r in doc_ref.split(";") if r.strip()}
+
+
+def backfill_doc_ref(session: Session) -> int:
+    """Recalcula doc_ref para TODAS las quote_requests con el extractor de referencias
+    vigente (asunto + snippet). Necesario porque las filas viejas se guardaron con un
+    regex anterior que casi nunca casaba, dejando doc_ref nulo y haciendo imposible el
+    cruce por referencia. Idempotente. Devuelve cuantas filas cambiaron."""
+    from .mail_reader import extraer_referencias  # import perezoso (evita ciclo)
+
+    cambiadas = 0
+    for r in session.execute(select(QuoteRequestRow)).scalars().all():
+        refs = extraer_referencias(r.subject or "", r.snippet or "")
+        nuevo = ";".join(sorted(refs)) if refs else None
+        if nuevo != r.doc_ref:
+            r.doc_ref = nuevo
+            cambiadas += 1
+    if cambiadas:
+        session.commit()
+    return cambiadas
+
+
+def _demote_a_relacionado(
+    session: Session, dup: QuoteRequestRow, canonical: QuoteRequestRow,
+    relation_type: str,
+) -> None:
+    """Baja una cotizacion duplicada a quote_related_messages colgando del canonical.
+    Propaga al canonical el cliente externo y el estado de respuesta si este los tiene
+    y el canonical no."""
+    if not (canonical.external_client or "").strip() and (dup.external_client or "").strip():
+        canonical.external_client = dup.external_client
+    if dup.was_replied and not canonical.was_replied:
+        canonical.was_replied = True
+        canonical.replied_at = dup.replied_at or canonical.replied_at
+    # Re-apuntar lo que colgaba del duplicado hacia el canonical
+    for child in session.execute(
+        select(QuoteRelatedMessage).where(
+            QuoteRelatedMessage.quote_request_id == dup.id
+        )
+    ).scalars().all():
+        child.quote_request_id = canonical.id
+    if session.get(QuoteRelatedMessage, dup.graph_id) is None:
+        session.add(QuoteRelatedMessage(
+            graph_id=dup.graph_id,
+            quote_request_id=canonical.id,
+            mailbox=dup.mailbox,
+            conversation_id=dup.conversation_id,
+            subject=dup.subject,
+            sender_email=dup.sender_email,
+            sender_name=dup.sender_name,
+            received_at=dup.received_at,
+            snippet=dup.snippet,
+            is_forwarded_internal=dup.is_forwarded_internal,
+            internet_message_id=dup.internet_message_id,
+            relation_type=relation_type,
+        ))
+    session.delete(dup)
+
+
+def _rank_canonical(r: QuoteRequestRow) -> tuple:
+    """Orden de preferencia para elegir el canonical de un cluster: el correo
+    ORIGINAL del cliente (con cliente externo y NO reenviado) es el mejor; luego
+    cualquiera con cliente; luego un no-reenvio; desempata el mas antiguo."""
+    tiene_cliente = bool((r.external_client or "").strip())
+    es_reenvio = bool(r.is_forwarded_internal)
+    if tiene_cliente and not es_reenvio:
+        pref = 0
+    elif tiene_cliente:
+        pref = 1
+    elif not es_reenvio:
+        pref = 2
+    else:
+        pref = 3
+    return (pref, r.received_at or "")
+
+
+def enlazar_reenvios_internos(
+    session: Session, dry_run: bool = False
+) -> dict:
+    """Consolidacion de cotizaciones DUPLICADAS (el mismo RFQ que llega varias veces).
+
+    Cubre la duplicacion CROSS-REMITENTE y CROSS-ANALISTA que copia_logica (que keya en
+    asunto+remitente) no ve: el mismo pedido entra desde el cliente directo, desde el
+    despachador A y desde el despachador B, con remitentes y conversation_id distintos.
+
+    Estrategia:
+      - Agrupa todas las quote_requests por NUMERO DE REFERENCIA compartido (doc_ref).
+        Cada cluster con >1 fila es el mismo RFQ duplicado: se conserva el canonical
+        (el original del cliente; ver _rank_canonical) y las demas bajan a
+        quote_related_messages ('reenvio_interno' si venian reenviadas, si no
+        'copia_referencia'). Alta confianza -> se aplica solo.
+      - Los reenvios HUERFANOS (sin cliente, sin referencia que case) se intentan casar
+        por ASUNTO normalizado contra una cotizacion con cliente; eso va a la cola de
+        validacion MANUAL (riesgo de falso positivo), no se aplica.
+
+    Idempotente. Devuelve {'auto': [...], 'manual': [...]}.
+    """
+    from collections import defaultdict
+
+    # Asegura que doc_ref este actualizado con el extractor vigente antes de cruzar.
+    backfill_doc_ref(session)
+
+    rows = session.execute(select(QuoteRequestRow)).scalars().all()
+
+    # --- 1) Clusters por referencia compartida (auto) ---
+    # Une rows que comparten >=1 referencia (transitivamente: A-B por ref X, B-C por
+    # ref Y => {A,B,C}) via union-find sobre las referencias.
+    padre: dict[int, int] = {r.id: r.id for r in rows}
+    def find(x):
+        while padre[x] != x:
+            padre[x] = padre[padre[x]]
+            x = padre[x]
+        return x
+    def union(a, b):
+        padre[find(a)] = find(b)
+    ref_a_row: dict[str, int] = {}
+    for r in rows:
+        for ref in referencias_de(r.doc_ref):
+            if ref in ref_a_row:
+                union(r.id, ref_a_row[ref])
+            else:
+                ref_a_row[ref] = r.id
+    clusters: dict[int, list[QuoteRequestRow]] = defaultdict(list)
+    for r in rows:
+        if referencias_de(r.doc_ref):
+            clusters[find(r.id)].append(r)
+
+    auto: list[dict] = []
+    consolidados: set[int] = set()
+    for miembros in clusters.values():
+        if len(miembros) < 2:
+            continue
+        miembros.sort(key=_rank_canonical)
+        canonical = miembros[0]
+        for dup in miembros[1:]:
+            rel = "reenvio_interno" if dup.is_forwarded_internal else "copia_referencia"
+            auto.append({
+                "orig_id": canonical.id, "orig_mailbox": canonical.mailbox,
+                "dup_id": dup.id, "dup_mailbox": dup.mailbox,
+                "cliente": canonical.external_client or dup.external_client,
+                "ref": sorted(referencias_de(dup.doc_ref) & referencias_de(canonical.doc_ref))
+                       or sorted(referencias_de(dup.doc_ref)),
+                "rel": rel,
+            })
+            consolidados.add(dup.id)
+            if not dry_run:
+                _demote_a_relacionado(session, dup, canonical, rel)
+
+    # --- 2) Huerfanos sin referencia: match por asunto -> cola manual ---
+    ya_en_cola = {
+        (c.rv_quote_id, c.orig_quote_id)
+        for c in session.execute(
+            select(ReenvioLinkCandidato).where(
+                ReenvioLinkCandidato.estado == "pendiente"
+            )
+        ).scalars().all()
+    }
+    con_cliente = [r for r in rows if (r.external_client or "").strip()]
+    manual: list[dict] = []
+    for rv in rows:
+        if rv.id in consolidados:
+            continue
+        if not rv.is_forwarded_internal or (rv.external_client or "").strip():
+            continue
+        if referencias_de(rv.doc_ref):
+            continue  # tenia ref pero no caso: no forzar por asunto
+        asunto_rv = _normalizar_asunto(rv.subject)
+        if len(asunto_rv) < 8:
+            continue
+        for orig in con_cliente:
+            if orig.id == rv.id:
+                continue
+            if _normalizar_asunto(orig.subject) == asunto_rv:
+                if (rv.id, orig.id) in ya_en_cola:
+                    break
+                manual.append({
+                    "rv_id": rv.id, "rv_subject": rv.subject, "rv_mailbox": rv.mailbox,
+                    "orig_id": orig.id, "orig_mailbox": orig.mailbox,
+                    "cliente": orig.external_client, "asunto": asunto_rv,
+                })
+                if not dry_run:
+                    session.add(ReenvioLinkCandidato(
+                        rv_quote_id=rv.id, rv_mailbox=rv.mailbox, rv_subject=rv.subject,
+                        orig_quote_id=orig.id, orig_mailbox=orig.mailbox,
+                        orig_subject=orig.subject, orig_external_client=orig.external_client,
+                        asunto_normalizado=asunto_rv,
+                    ))
+                break
+
+    if not dry_run:
+        session.commit()
+    return {"auto": auto, "manual": manual}
+
+
+def find_claude_review_by_reference(
+    session: Session, refs: set[str] | list[str]
+) -> ClaudeReview | None:
+    """Representante de staging por NUMERO DE REFERENCIA: el review mas antiguo (que no
+    es copia) cuyo asunto comparte alguna referencia con `refs`. Sirve para deduplicar
+    EN EL STAGING el mismo RFQ que llega de remitentes distintos (cliente directo +
+    varios despachadores) — caso que copia_logica (asunto+remitente) no ve."""
+    from .mail_reader import extraer_referencias  # import perezoso
+
+    refs = set(refs)
+    if not refs:
+        return None
+    candidatos = session.execute(
+        select(ClaudeReview)
+        .where(ClaudeReview.estado != "copia_logica")
+        .order_by(ClaudeReview.classified_at)
+    ).scalars().all()
+    for rev in candidatos:
+        if refs & set(extraer_referencias(rev.subject or "", "")):
+            return rev
+    return None
+
+
+def consolidar_staging_por_referencia(session: Session) -> int:
+    """Limpieza: colapsa en la cola de revision (claude_reviews) los duplicados del
+    mismo RFQ que comparten numero de referencia pero llegaron de remitentes distintos
+    (lo que copia_logica no agrupo). Conserva un representante por referencia (uno ya
+    decidido si existe, si no el mas antiguo pendiente) y marca los demas PENDIENTES como
+    copia (heredan la decision del representante). Devuelve cuantos colapso. Idempotente."""
+    from collections import defaultdict
+    from .mail_reader import extraer_referencias
+
+    reviews = session.execute(
+        select(ClaudeReview).where(ClaudeReview.estado != "copia_logica")
+    ).scalars().all()
+
+    # Union-find por referencia compartida (transitivo)
+    padre: dict[str, str] = {r.graph_id: r.graph_id for r in reviews}
+    def find(x):
+        while padre[x] != x:
+            padre[x] = padre[padre[x]]
+            x = padre[x]
+        return x
+    ref_a_gid: dict[str, str] = {}
+    refs_de: dict[str, set[str]] = {}
+    for r in reviews:
+        rs = set(extraer_referencias(r.subject or "", ""))
+        refs_de[r.graph_id] = rs
+        for ref in rs:
+            if ref in ref_a_gid:
+                padre[find(r.graph_id)] = find(ref_a_gid[ref])
+            else:
+                ref_a_gid[ref] = r.graph_id
+
+    grupos: dict[str, list[ClaudeReview]] = defaultdict(list)
+    for r in reviews:
+        if refs_de[r.graph_id]:
+            grupos[find(r.graph_id)].append(r)
+
+    colapsados = 0
+    for miembros in grupos.values():
+        if len(miembros) < 2:
+            continue
+        # Representante: uno ya decidido si existe; si no, el mas antiguo pendiente.
+        miembros.sort(key=lambda r: (
+            0 if r.estado in ("aprobado", "rechazado") else 1,
+            r.classified_at or datetime.min,
+        ))
+        rep = miembros[0]
+        for r in miembros[1:]:
+            if r.estado in ("aprobado", "rechazado", "copia_logica"):
+                continue  # no tocar decididos ni copias ya marcadas
+            msg = deserialize_message(r.message_json)
+            registrar_copia_logica(session, msg, rep)
+            colapsados += 1
+    if colapsados:
+        session.commit()
+    return colapsados
+
+
+def aprobar_enlace_candidato(session: Session, candidato_id: int) -> bool:
+    """Aplica un enlace de la cola manual: baja el RV a reenvio del original y marca
+    el candidato como aprobado. Devuelve False si no existe o ya no aplica."""
+    cand = session.get(ReenvioLinkCandidato, candidato_id)
+    if cand is None or cand.estado != "pendiente":
+        return False
+    rv = session.get(QuoteRequestRow, cand.rv_quote_id)
+    original = session.get(QuoteRequestRow, cand.orig_quote_id)
+    if rv is None or original is None:
+        cand.estado = "descartado"
+        session.commit()
+        return False
+    _demote_a_relacionado(session, rv, original, "reenvio_interno")
+    cand.estado = "aprobado"
+    session.commit()
+    return True
+
+
+def descartar_enlace_candidato(session: Session, candidato_id: int) -> bool:
+    cand = session.get(ReenvioLinkCandidato, candidato_id)
+    if cand is None or cand.estado != "pendiente":
+        return False
+    cand.estado = "descartado"
+    session.commit()
+    return True
+
+
+def find_claude_review_by_imid(
+    session: Session, internet_message_id: str | None
+) -> ClaudeReview | None:
+    """Busca un review de Claude por internet_message_id (RFC Message-ID, estable
+    cross-mailbox). Sirve para deduplicar EN EL STAGING: el mismo correo recibido
+    en varios buzones interceptados tiene el mismo Message-ID (pero distinto
+    graph_id por buzon), y solo debe clasificarse/revisarse UNA vez."""
+    if not internet_message_id:
+        return None
+    return session.execute(
+        select(ClaudeReview)
+        .where(ClaudeReview.internet_message_id == internet_message_id)
+        .order_by(ClaudeReview.classified_at)
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+# ---------------------------------------------------------------------------
+# Dedup LOGICO: agrupar correos equivalentes (mismo asunto + remitente) aunque
+# tengan Message-ID/conversation distintos (reenvios repetidos del despachador).
+# ---------------------------------------------------------------------------
+
+_PREFIJOS_ASUNTO = re.compile(
+    r"^\s*((re|rv|rsv|res|reply|fw|fwd|rmt|tr|fyi|psi)\s*:\s*)+", re.IGNORECASE
+)
+
+
+def _normalizar_asunto(subject: str) -> str:
+    """Quita prefijos de reenvio/respuesta repetidos (RE:/RV:/FW:...), colapsa
+    espacios y pasa a minusculas. 'RV: RE: Petición de oferta' -> 'petición de oferta'."""
+    s = (subject or "").strip()
+    prev = None
+    while prev != s:
+        prev = s
+        s = _PREFIJOS_ASUNTO.sub("", s).strip()
+    return re.sub(r"\s+", " ", s).lower()
+
+
+def clave_grupo_logico(subject: str, sender_email: str) -> str | None:
+    """Clave de agrupacion logica = asunto normalizado + remitente. Devuelve None
+    si el asunto queda demasiado corto/trivial para ser discriminante (evita
+    colapsar solicitudes distintas que solo comparten un asunto generico)."""
+    asunto = _normalizar_asunto(subject)
+    if len(asunto) < 8:
+        return None
+    remitente = (sender_email or "").strip().lower()
+    return f"{asunto}|{remitente}"
+
+
+def find_review_by_group(
+    session: Session, group_logico: str | None
+) -> ClaudeReview | None:
+    """Representante de un grupo logico: el review mas antiguo que NO es copia."""
+    if not group_logico:
+        return None
+    return session.execute(
+        select(ClaudeReview)
+        .where(
+            ClaudeReview.group_logico == group_logico,
+            ClaudeReview.estado != "copia_logica",
+        )
+        .order_by(ClaudeReview.classified_at)
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def _aplicar_decision_a_copia(
+    session: Session, copia: ClaudeReview, es_cotizacion: bool,
+    parent_quote_id: int | None,
+) -> None:
+    """Aplica a una copia logica la MISMA suerte del representante: si es
+    cotizacion, se consolida bajo la cotizacion padre; si no, se descarta."""
+    copia.human_decision_es_cotizacion = es_cotizacion
+    copia.reviewed_at = datetime.utcnow()
+    if es_cotizacion and parent_quote_id is not None:
+        msg = deserialize_message(copia.message_json)
+        upsert_related(session, msg, parent_quote_id, relation_type="copia_logica")
+        mark_processed(session, copia.graph_id, copia.mailbox, copia.subject,
+                       "identificado", "copia_logica")
+    else:
+        mark_processed(session, copia.graph_id, copia.mailbox, copia.subject,
+                       "descartado", "copia_logica_rechazada")
+    session.commit()
+
+
+def registrar_copia_logica(
+    session: Session, msg, representante: ClaudeReview
+) -> str:
+    """Registra un correo como COPIA LOGICA del representante (sin gastar Claude).
+    Si el representante ya tiene decision humana, la copia la hereda de inmediato.
+    Devuelve un 'reason' para processed_messages."""
+    copia = session.get(ClaudeReview, msg.id)
+    if copia is None:
+        copia = ClaudeReview(graph_id=msg.id)
+        session.add(copia)
+    copia.mailbox = msg.mailbox
+    copia.subject = msg.subject
+    copia.sender_email = msg.sender_email
+    copia.received_at = msg.received_at
+    copia.internet_message_id = msg.internet_message_id
+    copia.message_json = serialize_message(msg)
+    copia.es_cotizacion_cliente = representante.es_cotizacion_cliente
+    copia.tipo = representante.tipo
+    copia.confianza = representante.confianza
+    copia.veredicto_final = "(copia logica del representante)"
+    copia.estado = "copia_logica"
+    copia.group_logico = representante.group_logico
+    copia.representante_graph_id = representante.graph_id
+    copia.classified_at = datetime.utcnow()
+    session.commit()
+
+    if representante.estado in ("aprobado", "rechazado"):
+        parent_id = None
+        if representante.estado == "aprobado":
+            parent = upsert_quote(session, representante.graph_id)
+            parent_id = parent.id if parent else None
+        _aplicar_decision_a_copia(
+            session, copia,
+            es_cotizacion=bool(representante.human_decision_es_cotizacion),
+            parent_quote_id=parent_id,
+        )
+        return ("copia_logica_aprobada" if representante.estado == "aprobado"
+                else "copia_logica_rechazada")
+    return "copia_logica_pendiente"
+
+
+def propagar_a_copias_logicas(
+    session: Session, representante_graph_id: str, es_cotizacion: bool,
+    parent_quote_id: int | None,
+) -> int:
+    """Tras decidir el representante, aplica la misma decision a sus copias logicas
+    aun sin resolver. Devuelve cuantas copias se afectaron."""
+    copias = session.execute(
+        select(ClaudeReview).where(
+            ClaudeReview.representante_graph_id == representante_graph_id,
+            ClaudeReview.estado == "copia_logica",
+            ClaudeReview.human_decision_es_cotizacion.is_(None),
+        )
+    ).scalars().all()
+    for copia in copias:
+        _aplicar_decision_a_copia(session, copia, es_cotizacion, parent_quote_id)
+    return len(copias)
 
 
 def find_by_imid(
